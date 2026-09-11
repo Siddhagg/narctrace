@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>NarcTrace — Digital Companion for Field Drug Testing</title>
+<meta name="description" content="NarcTrace: a digital companion for existing colorimetric field drug-testing kits. Guided capture, colour extraction assistance, and a traceable digital record." />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧪</text></svg>" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">🧪</span>
+    <div class="brand-text">
+      <span class="brand-name">NarcTrace</span>
+      <span class="brand-sub">Digital Companion for Field Drug Testing</span>
+    </div>
+  </div>
+  <nav class="topnav" id="topnav" hidden>
+    <button class="nav-btn" data-nav="test" id="navTest">New Test</button>
+    <button class="nav-btn" data-nav="history" id="navHistory">Test History</button>
+    <span class="officer-chip" id="officerChip" hidden></span>
+  </nav>
+</header>
+
+<main id="app">
+
+  <!-- ================= SCREEN: PERMISSIONS ================= -->
+  <section class="screen" id="screen-permissions">
+    <div class="card intro-card">
+      <h1>Enable Camera &amp; Location</h1>
+      <p class="muted">NarcTrace needs access to your device camera and GPS location to guide photo capture and attach a verifiable time &amp; place to every test record.</p>
+
+      <div class="perm-row">
+        <div class="perm-item" id="permCameraItem">
+          <span class="perm-icon">📷</span>
+          <div class="perm-info">
+            <strong>Camera</strong>
+            <span class="perm-status" id="permCameraStatus">Not requested</span>
+          </div>
+        </div>
+        <div class="perm-item" id="permLocationItem">
+          <span class="perm-icon">📍</span>
+          <div class="perm-info">
+            <strong>Location</strong>
+            <span class="perm-status" id="permLocationStatus">Not requested</span>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-lg" id="btnEnable">Enable Camera &amp; Location</button>
+      <p class="error-text" id="permError" hidden></p>
+
+      <div class="disclaimer">
+        ⚠️ <strong>NarcTrace assists</strong> the existing field-testing process. It does <strong>not</strong> claim 100% AI drug detection. Confirmatory laboratory testing remains separate where required.
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: OFFICER LOGIN ================= -->
+  <section class="screen" id="screen-login" hidden>
+    <div class="card">
+      <h1>Officer Login</h1>
+      <p class="muted">Enter your details to begin. This identifies who conducted the test in the digital record.</p>
+      <label class="field">
+        <span>Officer Name</span>
+        <input type="text" id="officerName" placeholder="e.g. Officer A. Sharma" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>Badge / ID Number</span>
+        <input type="text" id="officerBadge" placeholder="e.g. Badge #4521" autocomplete="off" />
+      </label>
+      <button class="btn btn-primary btn-lg" id="btnLogin">Continue</button>
+      <p class="error-text" id="loginError" hidden></p>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: HOME (Start / History) ================= -->
+  <section class="screen" id="screen-home" hidden>
+    <div class="card home-card">
+      <h1>Welcome, <span id="homeOfficerName">Officer</span></h1>
+      <p class="muted">Choose an action to continue.</p>
+      <div class="home-actions">
+        <button class="btn btn-primary btn-lg" id="btnStartTest">▶ Start New Test</button>
+        <button class="btn btn-secondary btn-lg" id="btnViewHistory">🗂 Test History</button>
+      </div>
+      <button class="btn btn-link" id="btnLogout">Log out</button>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: ACTIVE TEST ================= -->
+  <section class="screen" id="screen-test" hidden>
+    <div class="test-grid">
+
+      <div class="card test-meta-card">
+        <div class="testid-row">
+          <span class="label">Test ID</span>
+          <span class="testid" id="activeTestId">FT-00000</span>
+        </div>
+        <div class="meta-line"><span>👮 Officer</span><strong id="metaOfficer">—</strong></div>
+        <div class="meta-line"><span>🕒 Started</span><strong id="metaTime">—</strong></div>
+        <div class="meta-line">
+          <span>📍 GPS</span>
+          <strong id="metaGpsStatus">Locating…</strong>
+        </div>
+        <div class="meta-line"><span>🧭 Coordinates</span><strong id="metaCoords">—</strong></div>
+        <div class="meta-line"><span>🏙️ City / State</span><strong id="metaCityState">—</strong></div>
+        <div class="meta-line small"><span>Approx. address</span><strong id="metaAddress">—</strong></div>
+        <div class="map-wrap" id="mapWrap" hidden>
+          <iframe id="mapFrame" title="Location map" loading="lazy"></iframe>
+        </div>
+      </div>
+
+      <div class="card camera-card">
+        <div class="camera-box">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlayCanvas"></canvas>
+          <canvas id="hiddenCanvas" hidden></canvas>
+          <div class="camera-status" id="cameraStatus">Starting camera…</div>
+        </div>
+
+        <div class="live-color-row">
+          <div class="swatch" id="liveSwatch"></div>
+          <div class="live-color-info">
+            <span class="muted small">Live focus-box reading</span>
+            <strong id="liveColorName">—</strong>
+            <span class="mono small" id="liveColorHex">—</span>
+          </div>
+        </div>
+
+        <div class="progress-row">
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <span class="progress-text" id="progressText">0 / 6 photos</span>
+        </div>
+
+        <div class="capture-actions">
+          <button class="btn btn-primary btn-lg" id="btnCapture">📸 Capture Photo</button>
+          <button class="btn btn-secondary" id="btnFinishEarly" hidden>Finish &amp; Review</button>
+        </div>
+        <p class="hint" id="captureHint">Place the object/reaction strip inside the focus box and hold steady.</p>
+      </div>
+
+      <div class="card thumbs-card">
+        <h3>Captured Photos</h3>
+        <div class="thumb-grid" id="thumbGrid"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: REPORT ================= -->
+  <section class="screen" id="screen-report" hidden>
+    <div class="card report-card">
+      <div class="report-header">
+        <h1>Test Report</h1>
+        <span class="testid" id="reportTestId">FT-00000</span>
+      </div>
+
+      <div class="report-grid">
+        <div class="report-field"><span>Officer</span><strong id="reportOfficer">—</strong></div>
+        <div class="report-field"><span>Timestamp</span><strong id="reportTime">—</strong></div>
+        <div class="report-field"><span>Coordinates</span><strong id="reportCoords">—</strong></div>
+        <div class="report-field"><span>City / State</span><strong id="reportCityState">—</strong></div>
+        <div class="report-field wide"><span>Approx. address</span><strong id="reportAddress">—</strong></div>
+        <div class="report-field"><span>Dominant reaction colour</span><strong id="reportDominantColor">—</strong></div>
+      </div>
+
+      <h3>Captured Frames &amp; Colour Analysis</h3>
+      <div class="report-photo-grid" id="reportPhotoGrid"></div>
+
+      <div class="disclaimer">
+        ⚠️ Colour readings assist documentation only. Compare against your test kit's reference chart to interpret the reaction. NarcTrace does not identify substances and is not a replacement for confirmatory laboratory testing.
+      </div>
+
+      <div class="report-actions">
+        <button class="btn btn-primary" id="btnSaveReport">💾 Save to Test History</button>
+        <button class="btn btn-secondary" id="btnNewTestFromReport">▶ Start Another Test</button>
+        <button class="btn btn-secondary" id="btnHistoryFromReport">🗂 View Test History</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: HISTORY ================= -->
+  <section class="screen" id="screen-history" hidden>
+    <div class="card history-card">
+      <div class="history-header">
+        <h1>Test History</h1>
+        <button class="btn btn-danger btn-sm" id="btnClearHistory">Clear All</button>
+      </div>
+      <p class="muted small">Stored only on this device (browser local storage). Nothing is uploaded to a server.</p>
+      <div id="historyEmpty" class="muted" hidden>No tests recorded yet.</div>
+      <div class="history-list" id="historyList"></div>
+      <button class="btn btn-secondary" id="btnBackHome">← Back</button>
+    </div>
+  </section>
+
+  <!-- ================= SCREEN: HISTORY DETAIL ================= -->
+  <section class="screen" id="screen-detail" hidden>
+    <div class="card report-card" id="detailCard"></div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <span>NarcTrace · SIH26231 · Team Vertex231 — Prototype for demonstration purposes only.</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
