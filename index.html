@@ -7,6 +7,7 @@
 <meta name="description" content="NarcTrace: a digital companion for existing colorimetric field drug-testing kits. Guided capture, colour extraction assistance, and a traceable digital record." />
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧪</text></svg>" />
 <link rel="stylesheet" href="style.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 </head>
 <body>
 
@@ -175,6 +176,7 @@
 
       <div class="report-actions">
         <button class="btn btn-primary" id="btnSaveReport">💾 Save to Test History</button>
+        <button class="btn btn-secondary" id="btnDownloadPdf">⬇ Download PDF Report</button>
         <button class="btn btn-secondary" id="btnNewTestFromReport">▶ Start Another Test</button>
         <button class="btn btn-secondary" id="btnHistoryFromReport">🗂 View Test History</button>
       </div>

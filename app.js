@@ -9,19 +9,6 @@
 const TARGET_PHOTOS = 6;
 const MIN_PHOTOS_TO_FINISH_EARLY = 4;
 
-const COLOR_PALETTE = [
-  ['Red',    [211, 47, 47]],
-  ['Orange', [245, 124, 0]],
-  ['Yellow', [251, 192, 45]],
-  ['Green',  [56, 142, 60]],
-  ['Blue',   [25, 90, 190]],
-  ['Purple', [123, 31, 162]],
-  ['Pink',   [216, 27, 96]],
-  ['Brown',  [109, 76, 65]],
-  ['Black',  [30, 30, 30]],
-  ['White',  [235, 235, 230]],
-  ['Gray',   [130, 130, 130]],
-];
 
 const el = (id) => document.getElementById(id);
 
@@ -60,17 +47,46 @@ function rgbToHex(r, g, b) {
   return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
-function nearestColorName(r, g, b) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const [name, [pr, pg, pb]] of COLOR_PALETTE) {
-    const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
-    if (d < bestDist) {
-      bestDist = d;
-      best = name;
-    }
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
   }
-  return best;
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+  return { h, s, v };
+}
+
+// Hue/saturation/value based classification — far more reliable for real
+// camera pixels than nearest-RGB-point matching, which frequently confused
+// blue/purple/green because it ignores brightness and saturation.
+function nearestColorName(r, g, b) {
+  const { h, s, v } = rgbToHsv(r, g, b);
+
+  if (v < 0.16) return 'Black';
+  if (s < 0.10 && v > 0.85) return 'White';
+  if (s < 0.16) return 'Gray';
+
+  // Light, desaturated warm hues read as Pink rather than Red.
+  if (v > 0.75 && s < 0.55 && (h >= 320 || h < 20)) return 'Pink';
+
+  // Dark, muted red/orange hues read as Brown rather than Orange/Red.
+  if (v < 0.55 && s > 0.25 && h >= 5 && h < 50) return 'Brown';
+
+  if (h < 12 || h >= 345) return 'Red';
+  if (h < 45) return 'Orange';
+  if (h < 65) return 'Yellow';
+  if (h < 170) return 'Green';
+  if (h < 255) return 'Blue';
+  if (h < 320) return 'Purple';
+  return 'Pink';
 }
 
 function generateTestId() {
@@ -504,6 +520,126 @@ el('btnSaveReport').addEventListener('click', () => {
 });
 el('btnNewTestFromReport').addEventListener('click', startNewTest);
 el('btnHistoryFromReport').addEventListener('click', () => { renderHistory(); showScreen('history'); });
+el('btnDownloadPdf').addEventListener('click', () => generatePdfReport(state.currentTest));
+
+/* --------------------- PDF export --------------------- */
+
+const DISCLAIMER_TEXT = "Colour readings assist documentation only. Compare against your test kit's reference chart to interpret the reaction. NarcTrace does not identify substances and is not a replacement for confirmatory laboratory testing.";
+
+function generatePdfReport(test) {
+  if (!test) return;
+  const { jsPDF } = window.jspdf || {};
+  if (!jsPDF) {
+    alert('PDF library failed to load. Check your internet connection and try again.');
+    return;
+  }
+
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 15;
+  const contentWidth = pageWidth - margin * 2;
+  let y = margin;
+
+  doc.setFontSize(18);
+  doc.setTextColor(20, 30, 40);
+  doc.text('NarcTrace — Test Report', margin, y);
+  y += 7;
+  doc.setFontSize(10);
+  doc.setTextColor(110, 110, 110);
+  doc.text('Digital Companion for Field Drug Testing · SIH26231 · Team Vertex231', margin, y);
+  y += 6;
+  doc.setDrawColor(210);
+  doc.line(margin, y, pageWidth - margin, y);
+  y += 9;
+
+  const dominant = test.photos.length ? modeColorName(test.photos) : null;
+  const dominantPhoto = dominant ? test.photos.find((p) => p.name === dominant) : null;
+
+  const fields = [
+    ['Test ID', test.id],
+    ['Officer', `${test.officer} (${test.badge})`],
+    ['Timestamp', formatTimestamp(new Date(test.startedAt))],
+    ['Coordinates', test.lat != null ? `${test.lat.toFixed(6)}, ${test.lon.toFixed(6)}` : 'Unavailable'],
+    ['City / State', [test.city, test.state].filter(Boolean).join(', ') || 'Unknown'],
+    ['Approx. Address', test.address || 'Unavailable'],
+    ['Dominant Colour', dominantPhoto ? `${dominant} (${dominantPhoto.hex})` : 'Unavailable'],
+  ];
+
+  doc.setFontSize(11);
+  const labelWidth = 42;
+  for (const [label, value] of fields) {
+    doc.setFont(undefined, 'bold');
+    doc.setTextColor(20, 30, 40);
+    doc.text(`${label}:`, margin, y);
+    doc.setFont(undefined, 'normal');
+    doc.setTextColor(50, 50, 50);
+    const wrapped = doc.splitTextToSize(String(value), contentWidth - labelWidth);
+    doc.text(wrapped, margin + labelWidth, y);
+    if (label === 'Dominant Colour' && dominantPhoto) {
+      doc.setFillColor(dominantPhoto.rgb.r, dominantPhoto.rgb.g, dominantPhoto.rgb.b);
+      doc.setDrawColor(180);
+      doc.rect(margin + labelWidth + doc.getTextWidth(`${dominant} (${dominantPhoto.hex})`) + 4, y - 4, 5, 5, 'FD');
+    }
+    y += 6.5 * wrapped.length;
+  }
+
+  y += 4;
+  doc.setDrawColor(210);
+  doc.line(margin, y, pageWidth - margin, y);
+  y += 9;
+
+  doc.setFontSize(13);
+  doc.setTextColor(20, 30, 40);
+  doc.text('Captured Frames & Colour Analysis', margin, y);
+  y += 8;
+
+  const imgW = 82, imgH = 61.5, labelH = 8, gapX = 10, gapY = 6;
+  const colX = [margin, margin + imgW + gapX];
+  let col = 0;
+
+  test.photos.forEach((photo) => {
+    if (y + imgH + labelH > pageHeight - margin) {
+      doc.addPage();
+      y = margin;
+      col = 0;
+    }
+    const x = colX[col];
+    try {
+      doc.addImage(photo.dataUrl, 'JPEG', x, y, imgW, imgH);
+    } catch (e) {
+      doc.setDrawColor(200);
+      doc.rect(x, y, imgW, imgH);
+    }
+    doc.setFillColor(photo.rgb.r, photo.rgb.g, photo.rgb.b);
+    doc.setDrawColor(180);
+    doc.rect(x, y + imgH + 1.5, 4.5, 4.5, 'FD');
+    doc.setFontSize(9.5);
+    doc.setTextColor(40, 40, 40);
+    doc.text(`${photo.name} · ${photo.hex}`, x + 6.5, y + imgH + 5);
+
+    if (col === 0) {
+      col = 1;
+    } else {
+      col = 0;
+      y += imgH + labelH + gapY;
+    }
+  });
+  if (col === 1) y += imgH + labelH + gapY;
+
+  y += 3;
+  if (y + 22 > pageHeight - margin) { doc.addPage(); y = margin; }
+  doc.setDrawColor(230, 180, 90);
+  doc.setFillColor(255, 249, 235);
+  const disclaimerLines = doc.splitTextToSize(DISCLAIMER_TEXT, contentWidth - 10);
+  const boxHeight = disclaimerLines.length * 4.5 + 6;
+  doc.rect(margin, y, contentWidth, boxHeight, 'FD');
+  doc.setFontSize(8.5);
+  doc.setTextColor(140, 100, 20);
+  doc.text(disclaimerLines, margin + 5, y + 6);
+
+  doc.save(`NarcTrace_${test.id}.pdf`);
+}
 
 /* --------------------- History (localStorage) --------------------- */
 
@@ -595,9 +731,11 @@ function showHistoryDetail(test) {
       ⚠️ Colour readings assist documentation only. Compare against your test kit's reference chart to interpret the reaction. NarcTrace does not identify substances and is not a replacement for confirmatory laboratory testing.
     </div>
     <div class="report-actions">
+      <button class="btn btn-secondary" id="btnDownloadPdfDetail">⬇ Download PDF Report</button>
       <button class="btn btn-secondary" id="btnBackToHistory">← Back to History</button>
     </div>
   `;
+  el('btnDownloadPdfDetail').addEventListener('click', () => generatePdfReport(test));
   el('btnBackToHistory').addEventListener('click', () => { renderHistory(); showScreen('history'); });
   showScreen('detail');
 }
