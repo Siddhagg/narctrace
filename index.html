@@ -127,8 +127,14 @@
           <div class="live-color-info">
             <span class="muted small">Live focus-box reading</span>
             <strong id="liveColorName">—</strong>
+            <span class="small" id="liveColorShade"></span>
             <span class="mono small" id="liveColorHex">—</span>
           </div>
+        </div>
+
+        <div class="calibrate-row">
+          <button class="btn btn-secondary btn-sm" id="btnCalibrate">🎯 Calibrate White Balance</button>
+          <span class="muted small" id="calibrateStatus">Auto white-balance active</span>
         </div>
 
         <div class="progress-row">
@@ -140,7 +146,7 @@
           <button class="btn btn-primary btn-lg" id="btnCapture">📸 Capture Photo</button>
           <button class="btn btn-secondary" id="btnFinishEarly" hidden>Finish &amp; Review</button>
         </div>
-        <p class="hint" id="captureHint">Place the object/reaction strip inside the focus box and hold steady.</p>
+        <p class="hint" id="captureHint">Place the object/reaction strip inside the focus box and hold steady. For the most accurate colour, calibrate against a plain white/gray surface first.</p>
       </div>
 
       <div class="card thumbs-card">

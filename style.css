@@ -224,6 +224,10 @@ main#app {
 .swatch { width: 46px; height: 46px; border-radius: 10px; border: 2px solid var(--card-border); flex-shrink: 0; background: #333; }
 .live-color-info { display: flex; flex-direction: column; }
 .live-color-info strong { font-size: 15px; }
+.live-color-info .small { color: var(--text-muted); min-height: 15px; }
+
+.calibrate-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.calibrate-row .btn-sm { padding: 8px 14px; }
 
 .progress-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .progress-track { flex: 1; height: 8px; background: var(--bg-elev); border-radius: 99px; overflow: hidden; }

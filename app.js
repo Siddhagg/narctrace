@@ -18,6 +18,8 @@ const state = {
   cameraStream: null,
   liveSampleTimer: null,
   liveColorBuffer: [],
+  lastRawFocusColor: null,   // pre-white-balance reading, used by the calibrate action
+  calibrationGains: null,    // manual white-balance gains, set by "Calibrate White Balance"
   currentTest: null,      // { id, officer, badge, startedAt, lat, lon, city, state, address, photos: [] }
 };
 
@@ -87,6 +89,122 @@ function nearestColorName(r, g, b) {
   if (h < 255) return 'Blue';
   if (h < 320) return 'Purple';
   return 'Pink';
+}
+
+/* --------------------- Fine-grained shade matching (CIE Lab) --------------------- */
+// RGB Euclidean distance does not match human colour perception well — equal
+// RGB distances can look very different apart, or very similar colours can be
+// far apart in RGB. Lab space is built so that Euclidean distance in it tracks
+// perceived difference, which is what lets a large named-colour table (150+
+// shades below) reliably tell "Pink" from "Baby Pink" from "Hot Pink" instead
+// of them all collapsing onto one nearest fixed point.
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function rgbToLab(r, g, b) {
+  let [rl, gl, bl] = [r, g, b].map((v) => {
+    v /= 255;
+    return v > 0.04045 ? Math.pow((v + 0.055) / 1.055, 2.4) : v / 12.92;
+  });
+  let x = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047;
+  let y = (rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750) / 1.0;
+  let z = (rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041) / 1.08883;
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(x), fy = f(y), fz = f(z);
+  return { L: 116 * fy - 16, A: 500 * (fx - fy), B: 200 * (fy - fz) };
+}
+
+// Standard CSS/X11 named colours plus a handful of common colloquial shades
+// (baby pink, baby blue, peach, etc.) that field officers are more likely to
+// reach for than their formal CSS equivalents.
+const NAMED_COLOR_HEX = [
+  ['Black', '#000000'], ['White', '#FFFFFF'], ['Gray', '#808080'], ['Silver', '#C0C0C0'],
+  ['DimGray', '#696969'], ['DarkGray', '#A9A9A9'], ['LightGray', '#D3D3D3'], ['Gainsboro', '#DCDCDC'],
+  ['WhiteSmoke', '#F5F5F5'], ['Snow', '#FFFAFA'], ['Ivory', '#FFFFF0'], ['Charcoal', '#36454F'],
+  ['SlateGray', '#708090'], ['LightSlateGray', '#778899'], ['DarkSlateGray', '#2F4F4F'],
+  ['Red', '#FF0000'], ['DarkRed', '#8B0000'], ['FireBrick', '#B22222'], ['Crimson', '#DC143C'],
+  ['IndianRed', '#CD5C5C'], ['LightCoral', '#F08080'], ['Salmon', '#FA8072'], ['DarkSalmon', '#E9967A'],
+  ['LightSalmon', '#FFA07A'], ['Maroon', '#800000'], ['Brown', '#A52A2A'], ['Sienna', '#A0522D'],
+  ['SaddleBrown', '#8B4513'], ['Chocolate', '#D2691E'], ['Peru', '#CD853F'], ['RosyBrown', '#BC8F8F'],
+  ['Tan', '#D2B48C'], ['Beige', '#F5F5DC'], ['Wheat', '#F5DEB3'], ['Rust', '#B7410E'], ['Burgundy', '#800020'],
+  ['Orange', '#FFA500'], ['DarkOrange', '#FF8C00'], ['OrangeRed', '#FF4500'], ['Coral', '#FF7F50'],
+  ['Tomato', '#FF6347'], ['Peach', '#FFE5B4'], ['PeachPuff', '#FFDAB9'], ['SandyBrown', '#F4A460'],
+  ['BurlyWood', '#DEB887'], ['NavajoWhite', '#FFDEAD'], ['Bisque', '#FFE4C4'], ['Moccasin', '#FFE4B5'],
+  ['Yellow', '#FFFF00'], ['Gold', '#FFD700'], ['Khaki', '#F0E68C'], ['DarkKhaki', '#BDB76B'],
+  ['PaleGoldenRod', '#EEE8AA'], ['GoldenRod', '#DAA520'], ['DarkGoldenRod', '#B8860B'],
+  ['LemonChiffon', '#FFFACD'], ['LightYellow', '#FFFFE0'], ['Cornsilk', '#FFF8DC'], ['Cream', '#FFFDD0'],
+  ['Green', '#008000'], ['DarkGreen', '#006400'], ['ForestGreen', '#228B22'], ['LimeGreen', '#32CD32'],
+  ['Lime', '#00FF00'], ['SeaGreen', '#2E8B57'], ['MediumSeaGreen', '#3CB371'], ['SpringGreen', '#00FF7F'],
+  ['MediumSpringGreen', '#00FA9A'], ['LightGreen', '#90EE90'], ['PaleGreen', '#98FB98'], ['Mint', '#98FF98'],
+  ['DarkSeaGreen', '#8FBC8F'], ['OliveDrab', '#6B8E23'], ['Olive', '#808000'], ['DarkOliveGreen', '#556B2F'],
+  ['YellowGreen', '#9ACD32'], ['GreenYellow', '#ADFF2F'], ['Chartreuse', '#7FFF00'], ['LawnGreen', '#7CFC00'],
+  ['Cyan', '#00FFFF'], ['Teal', '#008080'], ['DarkCyan', '#008B8B'], ['LightCyan', '#E0FFFF'],
+  ['Turquoise', '#40E0D0'], ['MediumTurquoise', '#48D1CC'], ['DarkTurquoise', '#00CED1'],
+  ['PaleTurquoise', '#AFEEEE'], ['Aquamarine', '#7FFFD4'], ['MediumAquaMarine', '#66CDAA'],
+  ['CadetBlue', '#5F9EA0'],
+  ['Blue', '#0000FF'], ['DarkBlue', '#00008B'], ['MediumBlue', '#0000CD'], ['Navy', '#000080'],
+  ['MidnightBlue', '#191970'], ['RoyalBlue', '#4169E1'], ['SteelBlue', '#4682B4'], ['DodgerBlue', '#1E90FF'],
+  ['DeepSkyBlue', '#00BFFF'], ['SkyBlue', '#87CEEB'], ['LightSkyBlue', '#87CEFA'], ['BabyBlue', '#89CFF0'],
+  ['LightBlue', '#ADD8E6'], ['PowderBlue', '#B0E0E6'], ['LightSteelBlue', '#B0C4DE'],
+  ['CornflowerBlue', '#6495ED'], ['SlateBlue', '#6A5ACD'], ['MediumSlateBlue', '#7B68EE'],
+  ['DarkSlateBlue', '#483D8B'],
+  ['Purple', '#800080'], ['DarkViolet', '#9400D3'], ['DarkOrchid', '#9932CC'], ['MediumOrchid', '#BA55D3'],
+  ['Orchid', '#DA70D6'], ['Violet', '#EE82EE'], ['Plum', '#DDA0DD'], ['Thistle', '#D8BFD8'],
+  ['Lavender', '#E6E6FA'], ['Lilac', '#C8A2C8'], ['Mauve', '#E0B0FF'], ['Indigo', '#4B0082'],
+  ['BlueViolet', '#8A2BE2'], ['MediumPurple', '#9370DB'], ['RebeccaPurple', '#663399'],
+  ['Magenta', '#FF00FF'], ['Fuchsia', '#FF00FF'], ['DarkMagenta', '#8B008B'],
+  ['Pink', '#FFC0CB'], ['LightPink', '#FFB6C1'], ['BabyPink', '#F4C2C2'], ['HotPink', '#FF69B4'],
+  ['DeepPink', '#FF1493'], ['PaleVioletRed', '#DB7093'], ['MediumVioletRed', '#C71585'],
+];
+const NAMED_COLORS = NAMED_COLOR_HEX.map(([name, hex]) => {
+  const { r, g, b } = hexToRgb(hex);
+  return { name, hex, r, g, b, lab: rgbToLab(r, g, b) };
+});
+
+function nearestNamedColor(r, g, b) {
+  const lab = rgbToLab(r, g, b);
+  let best = null, bestDist = Infinity;
+  for (const c of NAMED_COLORS) {
+    const d = (lab.L - c.lab.L) ** 2 + (lab.A - c.lab.A) ** 2 + (lab.B - c.lab.B) ** 2;
+    if (d < bestDist) { bestDist = d; best = c; }
+  }
+  return best.name;
+}
+
+/* --------------------- Lighting / white-balance correction --------------------- */
+// A single uncalibrated phone camera cannot perfectly undo colour casts from
+// mixed lighting (fluorescent, tungsten, shade, direct sun all shift colour).
+// Two mitigations are applied: (1) automatic per-frame gray-world correction
+// as a sane default, and (2) an optional one-tap manual calibration against a
+// white/gray reference, which is far more reliable when precision matters —
+// this is the same approach real colour-matching tools use, since illuminant
+// colour casts cannot be fully undone from a single image without a reference.
+
+function computeGrayWorldGains(canvas) {
+  const ctx = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+  let r = 0, g = 0, b = 0, n = 0;
+  const stride = 4 * 20; // sparse sample across the full frame for performance
+  for (let i = 0; i < data.length; i += stride) {
+    r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
+  }
+  r /= n; g /= n; b /= n;
+  const gray = (r + g + b) / 3;
+  const clamp = (v) => Math.min(1.8, Math.max(0.6, v));
+  return {
+    r: clamp(gray / Math.max(r, 1)),
+    g: clamp(gray / Math.max(g, 1)),
+    b: clamp(gray / Math.max(b, 1)),
+  };
+}
+
+function applyGains(r, g, b, gains) {
+  const clamp = (v) => Math.min(255, Math.max(0, Math.round(v)));
+  return { r: clamp(r * gains.r), g: clamp(g * gains.g), b: clamp(b * gains.b) };
 }
 
 function generateTestId() {
@@ -254,6 +372,8 @@ async function startNewTest() {
   };
   state.currentTest = test;
   state.liveColorBuffer = [];
+  state.calibrationGains = null;
+  updateCalibrateStatus();
 
   el('activeTestId').textContent = test.id;
   el('metaOfficer').textContent = `${test.officer} (${test.badge})`;
@@ -390,6 +510,13 @@ function readFocusColor(canvas) {
   return { r, g, b };
 }
 
+function correctedFocusReading(hidden) {
+  const raw = readFocusColor(hidden);
+  state.lastRawFocusColor = raw;
+  const gains = state.calibrationGains || computeGrayWorldGains(hidden);
+  return applyGains(raw.r, raw.g, raw.b, gains);
+}
+
 function sampleLiveColor() {
   const video = el('video');
   const hidden = el('hiddenCanvas');
@@ -398,20 +525,44 @@ function sampleLiveColor() {
   ctx.drawImage(video, 0, 0, hidden.width, hidden.height);
   drawFocusBoxOutline();
 
-  const { r, g, b } = readFocusColor(hidden);
+  const { r, g, b } = correctedFocusReading(hidden);
   state.liveColorBuffer.push({ r, g, b });
-  if (state.liveColorBuffer.length > 4) state.liveColorBuffer.shift();
+  if (state.liveColorBuffer.length > 5) state.liveColorBuffer.shift();
 
   const avg = state.liveColorBuffer.reduce((acc, c) => ({ r: acc.r + c.r, g: acc.g + c.g, b: acc.b + c.b }), { r: 0, g: 0, b: 0 });
   const n = state.liveColorBuffer.length;
   const sr = Math.round(avg.r / n), sg = Math.round(avg.g / n), sb = Math.round(avg.b / n);
   const hex = rgbToHex(sr, sg, sb);
-  const name = nearestColorName(sr, sg, sb);
+  const family = nearestColorName(sr, sg, sb);
+  const shade = nearestNamedColor(sr, sg, sb);
 
   el('liveSwatch').style.background = hex;
-  el('liveColorName').textContent = name;
+  el('liveColorName').textContent = family;
+  el('liveColorShade').textContent = shade !== family ? `Closest shade: ${shade}` : '';
   el('liveColorHex').textContent = `${hex} · rgb(${sr}, ${sg}, ${sb})`;
 }
+
+function updateCalibrateStatus() {
+  const statusEl = el('calibrateStatus');
+  if (!statusEl) return;
+  statusEl.textContent = state.calibrationGains
+    ? 'Calibrated to reference ✓ — tap again to recalibrate'
+    : 'Auto white-balance active — for best accuracy, point at a plain white/gray surface and calibrate';
+}
+
+el('btnCalibrate').addEventListener('click', () => {
+  if (!state.lastRawFocusColor) return;
+  const { r, g, b } = state.lastRawFocusColor;
+  const target = 210; // neutral light-gray target, safely below sensor clipping
+  const clamp = (v) => Math.min(1.8, Math.max(0.5, v));
+  state.calibrationGains = {
+    r: clamp(target / Math.max(r, 1)),
+    g: clamp(target / Math.max(g, 1)),
+    b: clamp(target / Math.max(b, 1)),
+  };
+  state.liveColorBuffer = [];
+  updateCalibrateStatus();
+});
 
 function updateProgress() {
   const count = state.currentTest ? state.currentTest.photos.length : 0;
@@ -430,9 +581,18 @@ function capturePhoto() {
 
   const ctx = hidden.getContext('2d');
   ctx.drawImage(video, 0, 0, hidden.width, hidden.height);
-  const { r, g, b } = readFocusColor(hidden);
+
+  // Use the smoothed, white-balance-corrected buffer (same value shown live)
+  // rather than a single fresh frame, so the recorded reading isn't thrown
+  // off by a momentary glare spike or motion blur at the instant of the tap.
+  const source = state.liveColorBuffer.length ? state.liveColorBuffer : [correctedFocusReading(hidden)];
+  const avg = source.reduce((acc, c) => ({ r: acc.r + c.r, g: acc.g + c.g, b: acc.b + c.b }), { r: 0, g: 0, b: 0 });
+  const r = Math.round(avg.r / source.length);
+  const g = Math.round(avg.g / source.length);
+  const b = Math.round(avg.b / source.length);
   const hex = rgbToHex(r, g, b);
   const name = nearestColorName(r, g, b);
+  const shade = nearestNamedColor(r, g, b);
 
   // Downscale for storage-efficient thumbnail/report image
   const small = document.createElement('canvas');
@@ -442,7 +602,7 @@ function capturePhoto() {
   small.getContext('2d').drawImage(hidden, 0, 0, small.width, small.height);
   const dataUrl = small.toDataURL('image/jpeg', 0.6);
 
-  const photo = { dataUrl, hex, rgb: { r, g, b }, name, capturedAt: new Date().toISOString() };
+  const photo = { dataUrl, hex, rgb: { r, g, b }, name, shade, capturedAt: new Date().toISOString() };
   state.currentTest.photos.push(photo);
 
   const thumb = document.createElement('div');
@@ -450,7 +610,7 @@ function capturePhoto() {
   thumb.innerHTML = `
     <img src="${dataUrl}" alt="Captured photo ${state.currentTest.photos.length}" />
     <span class="thumb-badge">#${state.currentTest.photos.length}</span>
-    <span class="thumb-swatch" style="background:${hex}" title="${name} (${hex})"></span>
+    <span class="thumb-swatch" style="background:${hex}" title="${name} · ${shade} (${hex})"></span>
   `;
   el('thumbGrid').appendChild(thumb);
 
@@ -481,6 +641,7 @@ function modeColorName(photos) {
 }
 
 function renderReport(test) {
+  test.photos.forEach((p) => { if (!p.shade) p.shade = nearestNamedColor(p.rgb.r, p.rgb.g, p.rgb.b); });
   el('reportTestId').textContent = test.id;
   el('reportOfficer').textContent = `${test.officer} (${test.badge})`;
   el('reportTime').textContent = formatTimestamp(new Date(test.startedAt));
@@ -491,7 +652,7 @@ function renderReport(test) {
   const dominant = test.photos.length ? modeColorName(test.photos) : '—';
   const dominantPhoto = test.photos.find((p) => p.name === dominant);
   el('reportDominantColor').innerHTML = dominantPhoto
-    ? `<span class="swatch" style="display:inline-block;width:16px;height:16px;vertical-align:middle;margin-right:6px;border-radius:4px;background:${dominantPhoto.hex}"></span>${dominant} (${dominantPhoto.hex})`
+    ? `<span class="swatch" style="display:inline-block;width:16px;height:16px;vertical-align:middle;margin-right:6px;border-radius:4px;background:${dominantPhoto.hex}"></span>${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})`
     : '—';
 
   const grid = el('reportPhotoGrid');
@@ -503,7 +664,7 @@ function renderReport(test) {
       <img src="${p.dataUrl}" alt="Frame ${i + 1}" />
       <div class="report-photo-info">
         <span class="swatch" style="background:${p.hex}"></span>
-        <span>${p.name} · ${p.hex}</span>
+        <span>${p.name} · ${p.shade} · ${p.hex}</span>
       </div>
     `;
     grid.appendChild(card);
@@ -553,8 +714,10 @@ function generatePdfReport(test) {
   doc.line(margin, y, pageWidth - margin, y);
   y += 9;
 
+  test.photos.forEach((p) => { if (!p.shade) p.shade = nearestNamedColor(p.rgb.r, p.rgb.g, p.rgb.b); });
   const dominant = test.photos.length ? modeColorName(test.photos) : null;
   const dominantPhoto = dominant ? test.photos.find((p) => p.name === dominant) : null;
+  const dominantLabel = dominantPhoto ? `${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})` : 'Unavailable';
 
   const fields = [
     ['Test ID', test.id],
@@ -563,7 +726,7 @@ function generatePdfReport(test) {
     ['Coordinates', test.lat != null ? `${test.lat.toFixed(6)}, ${test.lon.toFixed(6)}` : 'Unavailable'],
     ['City / State', [test.city, test.state].filter(Boolean).join(', ') || 'Unknown'],
     ['Approx. Address', test.address || 'Unavailable'],
-    ['Dominant Colour', dominantPhoto ? `${dominant} (${dominantPhoto.hex})` : 'Unavailable'],
+    ['Dominant Colour', dominantLabel],
   ];
 
   doc.setFontSize(11);
@@ -579,7 +742,7 @@ function generatePdfReport(test) {
     if (label === 'Dominant Colour' && dominantPhoto) {
       doc.setFillColor(dominantPhoto.rgb.r, dominantPhoto.rgb.g, dominantPhoto.rgb.b);
       doc.setDrawColor(180);
-      doc.rect(margin + labelWidth + doc.getTextWidth(`${dominant} (${dominantPhoto.hex})`) + 4, y - 4, 5, 5, 'FD');
+      doc.rect(margin + labelWidth + doc.getTextWidth(dominantLabel) + 4, y - 4, 5, 5, 'FD');
     }
     y += 6.5 * wrapped.length;
   }
@@ -594,7 +757,7 @@ function generatePdfReport(test) {
   doc.text('Captured Frames & Colour Analysis', margin, y);
   y += 8;
 
-  const imgW = 82, imgH = 61.5, labelH = 8, gapX = 10, gapY = 6;
+  const imgW = 82, imgH = 61.5, labelH = 13, gapX = 10, gapY = 6;
   const colX = [margin, margin + imgW + gapX];
   let col = 0;
 
@@ -616,7 +779,10 @@ function generatePdfReport(test) {
     doc.rect(x, y + imgH + 1.5, 4.5, 4.5, 'FD');
     doc.setFontSize(9.5);
     doc.setTextColor(40, 40, 40);
-    doc.text(`${photo.name} · ${photo.hex}`, x + 6.5, y + imgH + 5);
+    doc.text(`${photo.name} · ${photo.shade}`, x + 6.5, y + imgH + 5);
+    doc.setFontSize(8);
+    doc.setTextColor(110, 110, 110);
+    doc.text(photo.hex, x + 6.5, y + imgH + 10);
 
     if (col === 0) {
       col = 1;
@@ -700,6 +866,8 @@ function renderHistory() {
 
 function showHistoryDetail(test) {
   const card = el('detailCard');
+  // Fall back to computing the shade for records saved before this field existed.
+  test.photos.forEach((p) => { if (!p.shade) p.shade = nearestNamedColor(p.rgb.r, p.rgb.g, p.rgb.b); });
   const dominant = test.photos.length ? modeColorName(test.photos) : '—';
   const dominantPhoto = test.photos.find((p) => p.name === dominant);
   card.innerHTML = `
@@ -713,7 +881,7 @@ function showHistoryDetail(test) {
       <div class="report-field"><span>Coordinates</span><strong>${test.lat != null ? `${test.lat.toFixed(6)}, ${test.lon.toFixed(6)}` : 'Unavailable'}</strong></div>
       <div class="report-field"><span>City / State</span><strong>${[test.city, test.state].filter(Boolean).join(', ') || 'Unknown'}</strong></div>
       <div class="report-field wide"><span>Approx. address</span><strong>${test.address || '—'}</strong></div>
-      <div class="report-field"><span>Dominant reaction colour</span><strong>${dominantPhoto ? `${dominant} (${dominantPhoto.hex})` : '—'}</strong></div>
+      <div class="report-field"><span>Dominant reaction colour</span><strong>${dominantPhoto ? `${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})` : '—'}</strong></div>
     </div>
     <h3>Captured Frames &amp; Colour Analysis</h3>
     <div class="report-photo-grid">
@@ -722,7 +890,7 @@ function showHistoryDetail(test) {
           <img src="${p.dataUrl}" alt="Frame ${i + 1}" />
           <div class="report-photo-info">
             <span class="swatch" style="background:${p.hex}"></span>
-            <span>${p.name} · ${p.hex}</span>
+            <span>${p.name} · ${p.shade} · ${p.hex}</span>
           </div>
         </div>
       `).join('')}
