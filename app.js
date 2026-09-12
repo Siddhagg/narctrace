@@ -73,7 +73,7 @@ function nearestColorName(r, g, b) {
   const { h, s, v } = rgbToHsv(r, g, b);
 
   if (v < 0.16) return 'Black';
-  if (s < 0.10 && v > 0.85) return 'White';
+  if (s < 0.14 && v > 0.78) return 'White';
   if (s < 0.16) return 'Gray';
 
   // Light, desaturated warm hues read as Pink rather than Red.
@@ -553,7 +553,7 @@ function updateCalibrateStatus() {
 el('btnCalibrate').addEventListener('click', () => {
   if (!state.lastRawFocusColor) return;
   const { r, g, b } = state.lastRawFocusColor;
-  const target = 210; // neutral light-gray target, safely below sensor clipping
+  const target = 228; // bright neutral target — lands in the White bucket, safely below sensor clipping
   const clamp = (v) => Math.min(1.8, Math.max(0.5, v));
   state.calibrationGains = {
     r: clamp(target / Math.max(r, 1)),
@@ -630,14 +630,116 @@ function finishTest() {
 
 /* --------------------- Report --------------------- */
 
+const FAMILY_NAMES = ['Red', 'Orange', 'Yellow', 'Green', 'Blue', 'Purple', 'Pink', 'Brown', 'Black', 'White', 'Gray'];
+
+// A photo can carry three layers of colour info: the original AI reading
+// (never overwritten — kept for audit), an optional re-processed "enhanced"
+// reading, and an optional officer confirmation/correction (human-in-the-loop,
+// per the project's own mitigation plan). These helpers pick the most
+// authoritative value without ever discarding the earlier layers.
+function effectiveName(p) { return p.officerConfirmedName || (p.enhancedColor ? p.enhancedColor.name : p.name); }
+function effectiveShade(p) { return p.enhancedColor ? p.enhancedColor.shade : p.shade; }
+function effectiveHex(p) { return p.enhancedColor ? p.enhancedColor.hex : p.hex; }
+function effectiveRgb(p) { return p.enhancedColor ? p.enhancedColor.rgb : p.rgb; }
+
 function modeColorName(photos) {
   const counts = {};
-  for (const p of photos) counts[p.name] = (counts[p.name] || 0) + 1;
+  for (const p of photos) counts[effectiveName(p)] = (counts[effectiveName(p)] || 0) + 1;
   let best = null, bestCount = -1;
   for (const [name, c] of Object.entries(counts)) {
     if (c > bestCount) { best = name; bestCount = c; }
   }
   return best;
+}
+
+// Re-processes the whole captured frame (not just the small live sample) with
+// gray-world white-balance correction, producing a visually clearer image and
+// a more accurate colour reading — this is what "Fix Lighting" runs.
+function enhancePhotoLighting(photo, onDone) {
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    const gains = computeGrayWorldGains(canvas);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    const clamp = (v) => Math.min(255, Math.max(0, v));
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = clamp(data[i] * gains.r);
+      data[i + 1] = clamp(data[i + 1] * gains.g);
+      data[i + 2] = clamp(data[i + 2] * gains.b);
+    }
+    ctx.putImageData(imageData, 0, 0);
+
+    const { r, g, b } = readFocusColor(canvas);
+    const hex = rgbToHex(r, g, b);
+    photo.enhancedDataUrl = canvas.toDataURL('image/jpeg', 0.75);
+    photo.enhancedColor = { hex, rgb: { r, g, b }, name: nearestColorName(r, g, b), shade: nearestNamedColor(r, g, b) };
+    photo.showEnhanced = true;
+    onDone();
+  };
+  img.src = photo.dataUrl;
+}
+
+function buildPhotoCardHtml(p, i) {
+  const showEnhanced = !!(p.showEnhanced && p.enhancedDataUrl);
+  const src = showEnhanced ? p.enhancedDataUrl : p.dataUrl;
+  const hex = showEnhanced ? p.enhancedColor.hex : p.hex;
+  const name = showEnhanced ? p.enhancedColor.name : p.name;
+  const shade = showEnhanced ? p.enhancedColor.shade : p.shade;
+  const confirmed = p.officerConfirmedName || '';
+
+  const options = FAMILY_NAMES.map((n) => `<option value="${n}" ${confirmed === n ? 'selected' : ''}>${n}</option>`).join('');
+
+  return `
+    <div class="report-photo" data-photo-index="${i}">
+      <div class="report-photo-img-wrap">
+        <img src="${src}" alt="Frame ${i + 1}" />
+        ${showEnhanced ? '<span class="badge-enhanced">Enhanced</span>' : ''}
+      </div>
+      <div class="report-photo-info">
+        <span class="swatch" style="background:${hex}"></span>
+        <span>${name} · ${shade} · ${hex}</span>
+      </div>
+      <div class="report-photo-actions">
+        <button type="button" class="btn-xs" data-action="enhance">${p.enhancedDataUrl ? (showEnhanced ? '👁 Show Original' : '👁 Show Enhanced') : '🪄 Fix Lighting'}</button>
+        <select data-action="confirm" title="Officer confirmation — corrects the family without erasing the AI reading">
+          <option value="">Confirm family (AI: ${p.name})</option>
+          ${options}
+        </select>
+      </div>
+    </div>
+  `;
+}
+
+function wirePhotoCardEvents(test, grid, rerender) {
+  grid.querySelectorAll('[data-action="enhance"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const card = btn.closest('[data-photo-index]');
+      const i = Number(card.dataset.photoIndex);
+      const photo = test.photos[i];
+      if (photo.enhancedDataUrl) {
+        photo.showEnhanced = !photo.showEnhanced;
+        rerender();
+      } else {
+        btn.disabled = true;
+        btn.textContent = 'Processing…';
+        enhancePhotoLighting(photo, rerender);
+      }
+    });
+  });
+  grid.querySelectorAll('[data-action="confirm"]').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const card = sel.closest('[data-photo-index]');
+      const i = Number(card.dataset.photoIndex);
+      test.photos[i].officerConfirmedName = sel.value || null;
+      rerender();
+    });
+  });
 }
 
 function renderReport(test) {
@@ -648,33 +750,28 @@ function renderReport(test) {
   el('reportCoords').textContent = test.lat != null ? `${test.lat.toFixed(6)}, ${test.lon.toFixed(6)}` : 'Unavailable';
   el('reportCityState').textContent = [test.city, test.state].filter(Boolean).join(', ') || 'Unknown';
   el('reportAddress').textContent = test.address || '—';
+  el('reportNotes').value = test.notes || '';
 
   const dominant = test.photos.length ? modeColorName(test.photos) : '—';
-  const dominantPhoto = test.photos.find((p) => p.name === dominant);
+  const dominantPhoto = test.photos.find((p) => effectiveName(p) === dominant);
   el('reportDominantColor').innerHTML = dominantPhoto
-    ? `<span class="swatch" style="display:inline-block;width:16px;height:16px;vertical-align:middle;margin-right:6px;border-radius:4px;background:${dominantPhoto.hex}"></span>${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})`
+    ? `<span class="swatch" style="display:inline-block;width:16px;height:16px;vertical-align:middle;margin-right:6px;border-radius:4px;background:${effectiveHex(dominantPhoto)}"></span>${dominant} · ${effectiveShade(dominantPhoto)} (${effectiveHex(dominantPhoto)})`
     : '—';
 
   const grid = el('reportPhotoGrid');
-  grid.innerHTML = '';
-  test.photos.forEach((p, i) => {
-    const card = document.createElement('div');
-    card.className = 'report-photo';
-    card.innerHTML = `
-      <img src="${p.dataUrl}" alt="Frame ${i + 1}" />
-      <div class="report-photo-info">
-        <span class="swatch" style="background:${p.hex}"></span>
-        <span>${p.name} · ${p.shade} · ${p.hex}</span>
-      </div>
-    `;
-    grid.appendChild(card);
-  });
+  grid.innerHTML = test.photos.map((p, i) => buildPhotoCardHtml(p, i)).join('');
+  wirePhotoCardEvents(test, grid, () => renderReport(test));
 
   el('btnSaveReport').disabled = false;
   el('btnSaveReport').textContent = '💾 Save to Test History';
 }
 
+el('reportNotes').addEventListener('input', () => {
+  if (state.currentTest) state.currentTest.notes = el('reportNotes').value;
+});
+
 el('btnSaveReport').addEventListener('click', () => {
+  state.currentTest.notes = el('reportNotes').value;
   saveTestToHistory(state.currentTest);
   el('btnSaveReport').disabled = true;
   el('btnSaveReport').textContent = '✅ Saved';
@@ -716,8 +813,8 @@ function generatePdfReport(test) {
 
   test.photos.forEach((p) => { if (!p.shade) p.shade = nearestNamedColor(p.rgb.r, p.rgb.g, p.rgb.b); });
   const dominant = test.photos.length ? modeColorName(test.photos) : null;
-  const dominantPhoto = dominant ? test.photos.find((p) => p.name === dominant) : null;
-  const dominantLabel = dominantPhoto ? `${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})` : 'Unavailable';
+  const dominantPhoto = dominant ? test.photos.find((p) => effectiveName(p) === dominant) : null;
+  const dominantLabel = dominantPhoto ? `${dominant} · ${effectiveShade(dominantPhoto)} (${effectiveHex(dominantPhoto)})` : 'Unavailable';
 
   const fields = [
     ['Test ID', test.id],
@@ -740,7 +837,8 @@ function generatePdfReport(test) {
     const wrapped = doc.splitTextToSize(String(value), contentWidth - labelWidth);
     doc.text(wrapped, margin + labelWidth, y);
     if (label === 'Dominant Colour' && dominantPhoto) {
-      doc.setFillColor(dominantPhoto.rgb.r, dominantPhoto.rgb.g, dominantPhoto.rgb.b);
+      const drgb = effectiveRgb(dominantPhoto);
+      doc.setFillColor(drgb.r, drgb.g, drgb.b);
       doc.setDrawColor(180);
       doc.rect(margin + labelWidth + doc.getTextWidth(dominantLabel) + 4, y - 4, 5, 5, 'FD');
     }
@@ -757,32 +855,47 @@ function generatePdfReport(test) {
   doc.text('Captured Frames & Colour Analysis', margin, y);
   y += 8;
 
-  const imgW = 82, imgH = 61.5, labelH = 13, gapX = 10, gapY = 6;
+  const imgW = 82, imgH = 61.5, labelH = 17, gapX = 10, gapY = 6;
   const colX = [margin, margin + imgW + gapX];
   let col = 0;
 
-  test.photos.forEach((photo) => {
+  test.photos.forEach((photo, photoIndex) => {
     if (y + imgH + labelH > pageHeight - margin) {
       doc.addPage();
       y = margin;
       col = 0;
     }
     const x = colX[col];
+    const imgSrc = photo.enhancedDataUrl || photo.dataUrl;
+    // Explicit unique alias per image — jsPDF's auto-generated alias can
+    // collide between visually-similar images (a known jsPDF quirk), which
+    // silently drops all but one image onto the page.
+    const alias = `${test.id}-photo-${photoIndex}${photo.enhancedDataUrl ? '-enhanced' : ''}`;
     try {
-      doc.addImage(photo.dataUrl, 'JPEG', x, y, imgW, imgH);
+      doc.addImage(imgSrc, 'JPEG', x, y, imgW, imgH, alias);
     } catch (e) {
       doc.setDrawColor(200);
       doc.rect(x, y, imgW, imgH);
     }
-    doc.setFillColor(photo.rgb.r, photo.rgb.g, photo.rgb.b);
+    if (photo.enhancedDataUrl) {
+      doc.setFillColor(41, 211, 176);
+      doc.setFontSize(7);
+      doc.setTextColor(6, 35, 31);
+      doc.roundedRect(x + 2, y + 2, 20, 5, 1, 1, 'F');
+      doc.text('Enhanced', x + 3.5, y + 5.5);
+    }
+    const rgb = effectiveRgb(photo);
+    doc.setFillColor(rgb.r, rgb.g, rgb.b);
     doc.setDrawColor(180);
     doc.rect(x, y + imgH + 1.5, 4.5, 4.5, 'FD');
     doc.setFontSize(9.5);
     doc.setTextColor(40, 40, 40);
-    doc.text(`${photo.name} · ${photo.shade}`, x + 6.5, y + imgH + 5);
+    doc.text(`${effectiveName(photo)} · ${effectiveShade(photo)}`, x + 6.5, y + imgH + 5);
     doc.setFontSize(8);
     doc.setTextColor(110, 110, 110);
-    doc.text(photo.hex, x + 6.5, y + imgH + 10);
+    const noteBits = [effectiveHex(photo)];
+    if (photo.officerConfirmedName) noteBits.push(`officer-confirmed, AI said ${photo.name}`);
+    doc.text(doc.splitTextToSize(noteBits.join(' · '), imgW - 6.5), x + 6.5, y + imgH + 10);
 
     if (col === 0) {
       col = 1;
@@ -792,6 +905,23 @@ function generatePdfReport(test) {
     }
   });
   if (col === 1) y += imgH + labelH + gapY;
+
+  if (test.notes && test.notes.trim()) {
+    y += 5;
+    doc.setFontSize(11);
+    doc.setTextColor(20, 30, 40);
+    doc.setFont(undefined, 'bold');
+    if (y + 10 > pageHeight - margin) { doc.addPage(); y = margin; }
+    doc.text('Officer Notes / Remarks', margin, y);
+    y += 6;
+    doc.setFont(undefined, 'normal');
+    doc.setFontSize(9.5);
+    doc.setTextColor(50, 50, 50);
+    const noteLines = doc.splitTextToSize(test.notes.trim(), contentWidth);
+    if (y + noteLines.length * 4.8 > pageHeight - margin) { doc.addPage(); y = margin; }
+    doc.text(noteLines, margin, y);
+    y += noteLines.length * 4.8;
+  }
 
   y += 3;
   if (y + 22 > pageHeight - margin) { doc.addPage(); y = margin; }
@@ -850,10 +980,10 @@ function renderHistory() {
     row.className = 'history-row';
     const thumb = test.photos[0] ? test.photos[0].dataUrl : '';
     const dominant = test.photos.length ? modeColorName(test.photos) : null;
-    const dominantPhoto = dominant ? test.photos.find((p) => p.name === dominant) : null;
+    const dominantPhoto = dominant ? test.photos.find((p) => effectiveName(p) === dominant) : null;
     row.innerHTML = `
       ${thumb ? `<img src="${thumb}" alt="" />` : ''}
-      <span class="swatch" style="background:${dominantPhoto ? dominantPhoto.hex : '#333'}"></span>
+      <span class="swatch" style="background:${dominantPhoto ? effectiveHex(dominantPhoto) : '#333'}"></span>
       <div class="history-row-info">
         <div class="hrow-top"><span class="testid">${test.id}</span><strong>${test.officer}</strong></div>
         <span class="hrow-sub">${formatTimestamp(new Date(test.startedAt))} · ${[test.city, test.state].filter(Boolean).join(', ') || 'Unknown location'}</span>
@@ -864,12 +994,25 @@ function renderHistory() {
   });
 }
 
+function updateHistoryRecord(test) {
+  const history = loadHistory();
+  const idx = history.findIndex((t) => t.id === test.id && t.startedAt === test.startedAt);
+  if (idx === -1) return false;
+  history[idx] = test;
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function showHistoryDetail(test) {
   const card = el('detailCard');
   // Fall back to computing the shade for records saved before this field existed.
   test.photos.forEach((p) => { if (!p.shade) p.shade = nearestNamedColor(p.rgb.r, p.rgb.g, p.rgb.b); });
   const dominant = test.photos.length ? modeColorName(test.photos) : '—';
-  const dominantPhoto = test.photos.find((p) => p.name === dominant);
+  const dominantPhoto = test.photos.find((p) => effectiveName(p) === dominant);
   card.innerHTML = `
     <div class="report-header">
       <h1>Test Report</h1>
@@ -881,28 +1024,32 @@ function showHistoryDetail(test) {
       <div class="report-field"><span>Coordinates</span><strong>${test.lat != null ? `${test.lat.toFixed(6)}, ${test.lon.toFixed(6)}` : 'Unavailable'}</strong></div>
       <div class="report-field"><span>City / State</span><strong>${[test.city, test.state].filter(Boolean).join(', ') || 'Unknown'}</strong></div>
       <div class="report-field wide"><span>Approx. address</span><strong>${test.address || '—'}</strong></div>
-      <div class="report-field"><span>Dominant reaction colour</span><strong>${dominantPhoto ? `${dominant} · ${dominantPhoto.shade} (${dominantPhoto.hex})` : '—'}</strong></div>
+      <div class="report-field"><span>Dominant reaction colour</span><strong>${dominantPhoto ? `${dominant} · ${effectiveShade(dominantPhoto)} (${effectiveHex(dominantPhoto)})` : '—'}</strong></div>
     </div>
     <h3>Captured Frames &amp; Colour Analysis</h3>
-    <div class="report-photo-grid">
-      ${test.photos.map((p, i) => `
-        <div class="report-photo">
-          <img src="${p.dataUrl}" alt="Frame ${i + 1}" />
-          <div class="report-photo-info">
-            <span class="swatch" style="background:${p.hex}"></span>
-            <span>${p.name} · ${p.shade} · ${p.hex}</span>
-          </div>
-        </div>
-      `).join('')}
-    </div>
+    <div class="report-photo-grid" id="detailPhotoGrid">${test.photos.map((p, i) => buildPhotoCardHtml(p, i)).join('')}</div>
+    <label class="field" style="margin-top:14px;">
+      <span>Officer Notes / Remarks</span>
+      <textarea id="detailNotes" rows="3" placeholder="Any observations about the test, kit, or conditions...">${test.notes || ''}</textarea>
+    </label>
     <div class="disclaimer">
       ⚠️ Colour readings assist documentation only. Compare against your test kit's reference chart to interpret the reaction. NarcTrace does not identify substances and is not a replacement for confirmatory laboratory testing.
     </div>
     <div class="report-actions">
+      <button class="btn btn-primary" id="btnUpdateRecord">💾 Save Changes</button>
       <button class="btn btn-secondary" id="btnDownloadPdfDetail">⬇ Download PDF Report</button>
       <button class="btn btn-secondary" id="btnBackToHistory">← Back to History</button>
     </div>
   `;
+  const detailGrid = el('detailPhotoGrid');
+  wirePhotoCardEvents(test, detailGrid, () => showHistoryDetail(test));
+  el('detailNotes').addEventListener('input', () => { test.notes = el('detailNotes').value; });
+  el('btnUpdateRecord').addEventListener('click', () => {
+    test.notes = el('detailNotes').value;
+    const btn = el('btnUpdateRecord');
+    btn.textContent = updateHistoryRecord(test) ? '✅ Saved' : '⚠ Save failed (storage full)';
+    setTimeout(() => { btn.textContent = '💾 Save Changes'; }, 1800);
+  });
   el('btnDownloadPdfDetail').addEventListener('click', () => generatePdfReport(test));
   el('btnBackToHistory').addEventListener('click', () => { renderHistory(); showScreen('history'); });
   showScreen('detail');

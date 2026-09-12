@@ -154,7 +154,7 @@ main#app {
 
 .field { display: flex; flex-direction: column; gap: 6px; text-align: left; margin-bottom: 16px; }
 .field span { font-size: 13px; color: var(--text-muted); font-weight: 600; }
-.field input {
+.field input, .field textarea, .field select {
   background: var(--bg-elev);
   border: 1px solid var(--card-border);
   color: var(--text);
@@ -162,8 +162,9 @@ main#app {
   border-radius: var(--radius-sm);
   font-size: 15px;
   font-family: inherit;
+  resize: vertical;
 }
-.field input:focus { outline: none; border-color: var(--accent); }
+.field input:focus, .field textarea:focus, .field select:focus { outline: none; border-color: var(--accent); }
 
 .home-actions { display: flex; flex-direction: column; gap: 12px; margin: 24px 0 10px; }
 
@@ -208,7 +209,7 @@ main#app {
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
-.camera-box video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+.camera-box video { width: 100%; height: 100%; object-fit: cover; }
 .camera-box canvas#overlayCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .camera-status {
   position: absolute;
@@ -253,12 +254,28 @@ main#app {
 .report-field strong { font-size: 14px; }
 .report-field.wide { grid-column: 1 / -1; }
 
-.report-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; margin: 14px 0 6px; }
+.report-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin: 14px 0 6px; }
 .report-photo { background: var(--bg-elev); border: 1px solid var(--card-border); border-radius: var(--radius-sm); overflow: hidden; }
+.report-photo-img-wrap { position: relative; }
 .report-photo img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; }
-.report-photo-info { padding: 8px 10px; display: flex; align-items: center; gap: 8px; }
-.report-photo-info .swatch { width: 22px; height: 22px; border-radius: 5px; margin: 0; }
+.report-photo-img-wrap .badge-enhanced {
+  position: absolute; top: 6px; left: 6px; background: rgba(41, 211, 176, 0.9); color: #06231f;
+  font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 6px;
+}
+.report-photo-info { padding: 8px 10px 4px; display: flex; align-items: center; gap: 8px; }
+.report-photo-info .swatch { width: 22px; height: 22px; border-radius: 5px; margin: 0; flex-shrink: 0; }
 .report-photo-info span { font-size: 11px; }
+.report-photo-actions { padding: 0 10px 10px; display: flex; flex-direction: column; gap: 6px; }
+.report-photo-actions .btn-xs {
+  font-size: 11px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--card-border); color: var(--text);
+  border-radius: 7px; cursor: pointer; width: 100%;
+}
+.report-photo-actions .btn-xs:hover { border-color: var(--accent); }
+.report-photo-actions select {
+  font-size: 11px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--card-border); color: var(--text);
+  border-radius: 7px; width: 100%;
+}
+.confirm-note { font-size: 10px; color: var(--text-muted); padding: 0 10px 8px; }
 
 .report-actions { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
 
