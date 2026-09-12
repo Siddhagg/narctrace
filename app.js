@@ -8,6 +8,7 @@
 
 const TARGET_PHOTOS = 6;
 const MIN_PHOTOS_TO_FINISH_EARLY = 4;
+const VARIANCE_WARNING_THRESHOLD = 42; // stddev (0-255 scale) above which a reading is flagged low-confidence
 
 
 const el = (id) => document.getElementById(id);
@@ -20,6 +21,8 @@ const state = {
   liveColorBuffer: [],
   lastRawFocusColor: null,   // pre-white-balance reading, used by the calibrate action
   calibrationGains: null,    // manual white-balance gains, set by "Calibrate White Balance"
+  focusPoint: { xFrac: 0.5, yFrac: 0.5 }, // tap-to-focus sampling point, fraction of frame
+  focusRipple: null,
   currentTest: null,      // { id, officer, badge, startedAt, lat, lon, city, state, address, photos: [] }
 };
 
@@ -172,6 +175,61 @@ function nearestNamedColor(r, g, b) {
     if (d < bestDist) { bestDist = d; best = c; }
   }
   return best.name;
+}
+
+/* --------------------- Free colour-naming API --------------------- */
+// The 150-entry local table above is instant and works offline, but it's a
+// fixed list. api.color.pizza is a free, keyless, CORS-open colour-naming
+// service backed by an 800+ entry curated (Wikipedia-sourced) name list, and
+// it returns a `distance` — how far the requested colour actually is from
+// its nearest named entry — which doubles as a confidence signal. It's used
+// only after a photo is captured (not on every live tick) so it never blocks
+// the live preview and never spams the API.
+const API_DISTANCE_WARNING_THRESHOLD = 12; // CIE Lab units — above this, treat the name as approximate
+const colorApiCache = new Map();
+
+async function fetchApiColorName(hex) {
+  const key = hex.replace('#', '').toUpperCase();
+  if (colorApiCache.has(key)) return colorApiCache.get(key);
+  const promise = (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      const res = await fetch(`https://api.color.pizza/v1/?values=${key}&list=wikipedia`, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error('bad status');
+      const data = await res.json();
+      const c = data.colors && data.colors[0];
+      if (!c) throw new Error('no result');
+      return { name: c.name, distance: c.distance, link: c.meta && c.meta.link };
+    } catch (e) {
+      return null; // caller falls back to the local nearestNamedColor
+    }
+  })();
+  colorApiCache.set(key, promise);
+  return promise;
+}
+
+// Attaches the API-sourced name (once resolved) to whichever hex is
+// currently "active" for this photo (original or enhanced), then re-renders
+// via the caller-supplied callback. Safe to call repeatedly — cached per hex.
+function refreshApiName(photo, rerender) {
+  const hex = effectiveHex(photo);
+  if (photo.apiHex === hex && (photo.apiName || photo.apiStatus === 'failed')) return;
+  photo.apiStatus = 'pending';
+  photo.apiHex = hex;
+  fetchApiColorName(hex).then((result) => {
+    if (photo.apiHex !== hex) return; // a newer lookup superseded this one
+    if (result) {
+      photo.apiName = result.name;
+      photo.apiDistance = result.distance;
+      photo.apiLink = result.link || null;
+      photo.apiStatus = 'done';
+    } else {
+      photo.apiStatus = 'failed';
+    }
+    rerender();
+  });
 }
 
 /* --------------------- Lighting / white-balance correction --------------------- */
@@ -373,6 +431,8 @@ async function startNewTest() {
   state.currentTest = test;
   state.liveColorBuffer = [];
   state.calibrationGains = null;
+  state.focusPoint = { xFrac: 0.5, yFrac: 0.5 };
+  state.focusRipple = null;
   updateCalibrateStatus();
 
   el('activeTestId').textContent = test.id;
@@ -454,6 +514,11 @@ function stopCamera() {
 
 window.addEventListener('resize', resizeOverlay);
 
+document.querySelector('.camera-box').addEventListener('click', (e) => {
+  if (!state.cameraStream) return;
+  handleFocusTap(e.clientX, e.clientY);
+});
+
 function resizeOverlay() {
   const box = document.querySelector('.camera-box');
   const overlay = el('overlayCanvas');
@@ -465,9 +530,11 @@ function resizeOverlay() {
 
 function focusBoxRect(width, height) {
   const size = Math.floor(Math.min(width, height) * 0.35);
-  const x = Math.floor((width - size) / 2);
-  const y = Math.floor((height - size) / 2);
-  return { x, y, size };
+  const half = size / 2;
+  const { xFrac, yFrac } = state.focusPoint;
+  const cx = Math.min(width - half, Math.max(half, xFrac * width));
+  const cy = Math.min(height - half, Math.max(half, yFrac * height));
+  return { x: Math.floor(cx - half), y: Math.floor(cy - half), size };
 }
 
 function drawFocusBoxOutline() {
@@ -475,14 +542,14 @@ function drawFocusBoxOutline() {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   const { x, y, size } = focusBoxRect(overlay.width, overlay.height);
-  ctx.strokeStyle = '#29d3b0';
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
   ctx.lineWidth = 3;
   ctx.setLineDash([8, 6]);
   ctx.strokeRect(x, y, size, size);
   ctx.setLineDash([]);
   const corner = 14;
   ctx.lineWidth = 4;
-  ctx.strokeStyle = '#eaf0fb';
+  ctx.strokeStyle = '#ffffff';
   [[x, y, 1, 1], [x + size, y, -1, 1], [x, y + size, 1, -1], [x + size, y + size, -1, -1]].forEach(([cx, cy, dx, dy]) => {
     ctx.beginPath();
     ctx.moveTo(cx, cy + corner * dy);
@@ -490,6 +557,72 @@ function drawFocusBoxOutline() {
     ctx.lineTo(cx + corner * dx, cy);
     ctx.stroke();
   });
+
+  if (state.focusRipple) {
+    const age = Date.now() - state.focusRipple.at;
+    if (age < 500) {
+      const r = 14 + age / 8;
+      ctx.strokeStyle = `rgba(255,255,255,${1 - age / 500})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(state.focusRipple.px, state.focusRipple.py, r, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      state.focusRipple = null;
+    }
+  }
+}
+
+// Tap-to-focus: relocates the sampling box to wherever the user taps instead
+// of always reading the dead-center of the frame (which was often just
+// background — the #1 cause of readings defaulting to a flat Gray), and
+// asks the device camera hardware to focus there where that API exists.
+function handleFocusTap(clientX, clientY) {
+  const box = document.querySelector('.camera-box');
+  if (!box) return;
+  const rect = box.getBoundingClientRect();
+  const xFrac = (clientX - rect.left) / rect.width;
+  const yFrac = (clientY - rect.top) / rect.height;
+  if (xFrac < 0 || xFrac > 1 || yFrac < 0 || yFrac > 1) return;
+
+  state.focusPoint = { xFrac, yFrac };
+  state.liveColorBuffer = [];
+  state.focusRipple = { px: xFrac * box.clientWidth, py: yFrac * box.clientHeight, at: Date.now() };
+  drawFocusBoxOutline();
+  animateFocusRipple();
+
+  const captureHint = el('captureHint');
+  if (captureHint) {
+    captureHint.textContent = 'Focus point set — reading colour from where you tapped.';
+    setTimeout(() => {
+      if (captureHint.textContent === 'Focus point set — reading colour from where you tapped.') {
+        captureHint.textContent = 'Place the object/reaction strip inside the focus box and hold steady. For the most accurate colour, calibrate against a plain white/gray surface first.';
+      }
+    }, 2200);
+  }
+
+  if (state.cameraStream) {
+    const track = state.cameraStream.getVideoTracks()[0];
+    if (track && track.getCapabilities) {
+      try {
+        const caps = track.getCapabilities();
+        if (caps.pointsOfInterest) {
+          const advanced = [{ pointsOfInterest: [{ x: xFrac, y: yFrac }] }];
+          if (caps.focusMode && caps.focusMode.includes('single-shot')) advanced[0].focusMode = 'single-shot';
+          track.applyConstraints({ advanced }).catch(() => {});
+        }
+      } catch (e) {
+        // Hardware tap-to-focus isn't supported on this device/browser — the
+        // relocated sampling box above still fixes the actual colour reading.
+      }
+    }
+  }
+}
+
+function animateFocusRipple() {
+  if (!state.focusRipple) return;
+  drawFocusBoxOutline();
+  if (Date.now() - state.focusRipple.at < 500) requestAnimationFrame(animateFocusRipple);
 }
 
 function readFocusColor(canvas) {
@@ -507,7 +640,17 @@ function readFocusColor(canvas) {
   r = Math.round(r / n);
   g = Math.round(g / n);
   b = Math.round(b / n);
-  return { r, g, b };
+
+  // Second pass: how much do sampled pixels vary around that average? A
+  // patterned surface, a strong glare spot, or an edge straddling the focus
+  // box all show up as high variance — a useful "is this reading trustworthy"
+  // signal independent of what the colour itself turned out to be.
+  let sqDiff = 0;
+  for (let i = 0; i < data.length; i += stride) {
+    sqDiff += (data[i] - r) ** 2 + (data[i + 1] - g) ** 2 + (data[i + 2] - b) ** 2;
+  }
+  const variance = Math.sqrt(sqDiff / (n * 3));
+  return { r, g, b, variance };
 }
 
 function correctedFocusReading(hidden) {
@@ -594,6 +737,12 @@ function capturePhoto() {
   const name = nearestColorName(r, g, b);
   const shade = nearestNamedColor(r, g, b);
 
+  // A fresh read of the exact frame at capture time, just for its variance —
+  // high variance means the focus box straddles an edge, glare, or a
+  // patterned surface, so the reading is less trustworthy than usual.
+  const { variance } = readFocusColor(hidden);
+  const lowConfidence = variance > VARIANCE_WARNING_THRESHOLD;
+
   // Downscale for storage-efficient thumbnail/report image
   const small = document.createElement('canvas');
   const scale = 480 / hidden.width;
@@ -602,23 +751,28 @@ function capturePhoto() {
   small.getContext('2d').drawImage(hidden, 0, 0, small.width, small.height);
   const dataUrl = small.toDataURL('image/jpeg', 0.6);
 
-  const photo = { dataUrl, hex, rgb: { r, g, b }, name, shade, capturedAt: new Date().toISOString() };
+  const photo = { dataUrl, hex, rgb: { r, g, b }, name, shade, variance, lowConfidence, capturedAt: new Date().toISOString() };
   state.currentTest.photos.push(photo);
+  refreshApiName(photo, () => { if (!el('screen-test').hidden) renderThumbGrid(); });
 
-  const thumb = document.createElement('div');
-  thumb.className = 'thumb-item';
-  thumb.innerHTML = `
-    <img src="${dataUrl}" alt="Captured photo ${state.currentTest.photos.length}" />
-    <span class="thumb-badge">#${state.currentTest.photos.length}</span>
-    <span class="thumb-swatch" style="background:${hex}" title="${name} · ${shade} (${hex})"></span>
-  `;
-  el('thumbGrid').appendChild(thumb);
-
+  renderThumbGrid();
   updateProgress();
 
   if (state.currentTest.photos.length >= TARGET_PHOTOS) {
     finishTest();
   }
+}
+
+function renderThumbGrid() {
+  const grid = el('thumbGrid');
+  grid.innerHTML = state.currentTest.photos.map((p, i) => `
+    <div class="thumb-item">
+      <img src="${p.dataUrl}" alt="Captured photo ${i + 1}" />
+      <span class="thumb-badge">#${i + 1}</span>
+      ${p.lowConfidence ? '<span class="thumb-warning" title="Uneven area — high variation in sampled pixels">⚠</span>' : ''}
+      <span class="thumb-swatch" style="background:${effectiveHex(p)}" title="${effectiveName(p)} · ${effectiveShade(p)} (${effectiveHex(p)})"></span>
+    </div>
+  `).join('');
 }
 
 function finishTest() {
@@ -638,7 +792,11 @@ const FAMILY_NAMES = ['Red', 'Orange', 'Yellow', 'Green', 'Blue', 'Purple', 'Pin
 // per the project's own mitigation plan). These helpers pick the most
 // authoritative value without ever discarding the earlier layers.
 function effectiveName(p) { return p.officerConfirmedName || (p.enhancedColor ? p.enhancedColor.name : p.name); }
-function effectiveShade(p) { return p.enhancedColor ? p.enhancedColor.shade : p.shade; }
+function effectiveShade(p) {
+  const hex = effectiveHex(p);
+  if (p.apiName && p.apiHex === hex) return p.apiName;
+  return p.enhancedColor ? p.enhancedColor.shade : p.shade;
+}
 function effectiveHex(p) { return p.enhancedColor ? p.enhancedColor.hex : p.hex; }
 function effectiveRgb(p) { return p.enhancedColor ? p.enhancedColor.rgb : p.rgb; }
 
@@ -688,12 +846,18 @@ function enhancePhotoLighting(photo, onDone) {
 function buildPhotoCardHtml(p, i) {
   const showEnhanced = !!(p.showEnhanced && p.enhancedDataUrl);
   const src = showEnhanced ? p.enhancedDataUrl : p.dataUrl;
-  const hex = showEnhanced ? p.enhancedColor.hex : p.hex;
-  const name = showEnhanced ? p.enhancedColor.name : p.name;
-  const shade = showEnhanced ? p.enhancedColor.shade : p.shade;
+  const hex = effectiveHex(p);
+  const name = effectiveName(p);
+  const shade = effectiveShade(p);
   const confirmed = p.officerConfirmedName || '';
 
   const options = FAMILY_NAMES.map((n) => `<option value="${n}" ${confirmed === n ? 'selected' : ''}>${n}</option>`).join('');
+
+  const warnings = [];
+  if (p.lowConfidence) warnings.push('⚠ Uneven area — sampled pixels vary a lot. Fill the box with one flat surface.');
+  if (p.apiStatus === 'done' && typeof p.apiDistance === 'number' && p.apiDistance > API_DISTANCE_WARNING_THRESHOLD) {
+    warnings.push('⚠ Approximate colour match — no close named colour was found.');
+  }
 
   return `
     <div class="report-photo" data-photo-index="${i}">
@@ -703,8 +867,9 @@ function buildPhotoCardHtml(p, i) {
       </div>
       <div class="report-photo-info">
         <span class="swatch" style="background:${hex}"></span>
-        <span>${name} · ${shade} · ${hex}</span>
+        <span>${name} · ${shade}${p.apiStatus === 'pending' ? ' <em>(looking up exact name…)</em>' : ''} · ${hex}</span>
       </div>
+      ${warnings.length ? `<div class="photo-warning">${warnings.join('<br>')}</div>` : ''}
       <div class="report-photo-actions">
         <button type="button" class="btn-xs" data-action="enhance">${p.enhancedDataUrl ? (showEnhanced ? '👁 Show Original' : '👁 Show Enhanced') : '🪄 Fix Lighting'}</button>
         <select data-action="confirm" title="Officer confirmation — corrects the family without erasing the AI reading">
@@ -761,6 +926,7 @@ function renderReport(test) {
   const grid = el('reportPhotoGrid');
   grid.innerHTML = test.photos.map((p, i) => buildPhotoCardHtml(p, i)).join('');
   wirePhotoCardEvents(test, grid, () => renderReport(test));
+  test.photos.forEach((p) => refreshApiName(p, () => renderReport(test)));
 
   el('btnSaveReport').disabled = false;
   el('btnSaveReport').textContent = '💾 Save to Test History';
@@ -895,6 +1061,8 @@ function generatePdfReport(test) {
     doc.setTextColor(110, 110, 110);
     const noteBits = [effectiveHex(photo)];
     if (photo.officerConfirmedName) noteBits.push(`officer-confirmed, AI said ${photo.name}`);
+    if (photo.lowConfidence) noteBits.push('uneven area');
+    if (typeof photo.apiDistance === 'number' && photo.apiDistance > API_DISTANCE_WARNING_THRESHOLD) noteBits.push('approximate match');
     doc.text(doc.splitTextToSize(noteBits.join(' · '), imgW - 6.5), x + 6.5, y + imgH + 10);
 
     if (col === 0) {
@@ -1043,6 +1211,7 @@ function showHistoryDetail(test) {
   `;
   const detailGrid = el('detailPhotoGrid');
   wirePhotoCardEvents(test, detailGrid, () => showHistoryDetail(test));
+  test.photos.forEach((p) => refreshApiName(p, () => showHistoryDetail(test)));
   el('detailNotes').addEventListener('input', () => { test.notes = el('detailNotes').value; });
   el('btnUpdateRecord').addEventListener('click', () => {
     test.notes = el('detailNotes').value;
